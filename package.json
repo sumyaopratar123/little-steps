@@ -1,0 +1,18 @@
+{
+  "name": "little-steps",
+  "version": "1.0.0",
+  "description": "Little Steps - Trusted 24x7 Childcare Platform",
+  "main": "server/server.js",
+  "scripts": {
+    "server": "node server/server.js",
+    "server:dev": "nodemon server/server.js",
+    "client": "npm --prefix client run dev",
+    "client:build": "npm --prefix client run build",
+    "install:all": "npm install && npm --prefix server install && npm --prefix client install",
+    "seed": "node server/seed/seed.js",
+    "test": "npm --prefix server test"
+  },
+  "keywords": ["childcare", "babysitting", "24x7", "react", "express", "mongodb"],
+  "author": "Little Steps Team",
+  "license": "MIT"
+}
