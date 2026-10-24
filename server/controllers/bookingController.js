@@ -1,35 +1,49 @@
+const crypto = require('crypto');
 const Booking = require('../models/Booking');
 const ProviderProfile = require('../models/ProviderProfile');
-const User = require('../models/User');
 const Notification = require('../models/Notification');
 
-// Helper to convert "HH:mm" to minutes from midnight
-const timeToMinutes = (timeStr) => {
-  const [hours, minutes] = timeStr.split(':').map(Number);
+const timeToMinutes = (time) => {
+  const [hours, minutes] = String(time).split(':').map(Number);
   return hours * 60 + minutes;
 };
 
-// Helper to check if two time ranges overlap
-// Handles normal same-day ranges and overnight ranges (wrapping past midnight)
-const doRangesOverlap = (start1, end1, start2, end2, isOvernight1, isOvernight2) => {
-  let mStart1 = timeToMinutes(start1);
-  let mEnd1 = timeToMinutes(end1);
-  let mStart2 = timeToMinutes(start2);
-  let mEnd2 = timeToMinutes(end2);
+const doRangesOverlap = (
+  start1,
+  end1,
+  start2,
+  end2,
+  overnight1 = false,
+  overnight2 = false
+) => {
+  let s1 = timeToMinutes(start1);
+  let e1 = timeToMinutes(end1);
+  let s2 = timeToMinutes(start2);
+  let e2 = timeToMinutes(end2);
 
-  if (isOvernight1 && mEnd1 <= mStart1) {
-    mEnd1 += 24 * 60;
-  }
-  if (isOvernight2 && mEnd2 <= mStart2) {
-    mEnd2 += 24 * 60;
-  }
+  if (overnight1 && e1 <= s1) e1 += 1440;
+  if (overnight2 && e2 <= s2) e2 += 1440;
 
-  return mStart1 < mEnd2 && mEnd1 > mStart2;
+  // Handle bookings that cross midnight.
+  return (
+    (s1 < e2 && e1 > s2) ||
+    (overnight2 && s1 + 1440 < e2 && e1 + 1440 > s2) ||
+    (overnight1 && s1 < e2 + 1440 && e1 > s2 + 1440)
+  );
 };
 
-// @desc    Create a new booking with capacity & availability conflict checks
-// @route   POST /api/bookings
-// @access  Private (Parent only)
+const notifyUser = async (userId, title, message, link) => {
+  await Notification.create({
+    user: userId,
+    title,
+    message,
+    type: 'booking',
+    link
+  });
+};
+
+// POST /api/bookings
+// Create a booking.
 exports.createBooking = async (req, res, next) => {
   try {
     const {
@@ -43,156 +57,304 @@ exports.createBooking = async (req, res, next) => {
       specialInstructions
     } = req.body;
 
-    // Validate inputs
     if (!providerId || !dateString || !startTime || !endTime) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide provider, date, start time, and end time.'
+        message: 'Please provide provider, date, start time and end time.'
       });
     }
 
-    if (!emergencyContact || !emergencyContact.name || !emergencyContact.phone) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateString)) {
       return res.status(400).json({
         success: false,
-        message: 'Emergency contact name and phone number are required.'
+        message: 'Invalid booking date.'
       });
     }
 
-    if (!childDetails || !Array.isArray(childDetails) || childDetails.length === 0) {
+    const [year, month, day] = dateString.split('-').map(Number);
+    const bookingDate = new Date(year, month - 1, day);
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    if (
+      bookingDate.getFullYear() !== year ||
+      bookingDate.getMonth() !== month - 1 ||
+      bookingDate.getDate() !== day ||
+      bookingDate < today
+    ) {
       return res.status(400).json({
         success: false,
-        message: 'Please select or add at least one child for this booking.'
+        message: 'Please select a valid date today or in the future.'
       });
     }
 
-    // Check self-booking
-    if (req.user._id.toString() === providerId.toString()) {
+    if (
+      !emergencyContact ||
+      !emergencyContact.name ||
+      !emergencyContact.phone
+    ) {
       return res.status(400).json({
         success: false,
-        message: 'You cannot book your own childcare services.'
+        message: 'Emergency contact name and phone are required.'
       });
     }
 
-    // Find provider profile
-    let profile = await ProviderProfile.findOne({
-      $or: [{ user: providerId }, { _id: providerId }]
+    if (
+      !Array.isArray(childDetails) ||
+      childDetails.length === 0 ||
+      childDetails.some(
+        (child) =>
+          !child.name ||
+          child.age === undefined ||
+          child.age === null
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide valid details for at least one child.'
+      });
+    }
+
+    if (String(req.user._id) === String(providerId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'You cannot book your own childcare service.'
+      });
+    }
+
+    const profile = await ProviderProfile.findOne({
+      $or: [
+        { user: providerId },
+        { _id: providerId }
+      ]
     }).populate('user', 'name email phone');
 
-    if (!profile) {
+    if (!profile || !profile.user) {
       return res.status(404).json({
         success: false,
         message: 'Childcare provider not found.'
       });
     }
 
-    const providerUserId = profile.user._id;
-
-    // Verify provider is approved
     if (profile.verificationStatus !== 'verified') {
       return res.status(400).json({
         success: false,
-        message: 'This provider is not yet verified to accept bookings on Little Steps.'
+        message: 'This provider is not verified to accept bookings.'
       });
     }
 
+    const providerUserId = profile.user._id;
     const numberOfChildren = childDetails.length;
-    const maxCapacity = profile.maxCapacity || 3;
+    const maxCapacity = Math.max(
+      0,
+      Number(profile.maxCapacity) || 3
+    );
+    const overnightBooking = Boolean(isOvernight);
 
     if (numberOfChildren > maxCapacity) {
       return res.status(400).json({
         success: false,
-        message: `Booking exceeds provider's absolute capacity limit (${maxCapacity} children max).`
+        message: `Maximum capacity is ${maxCapacity} children.`
       });
     }
 
-    // Calculate duration in hours
+    if (
+      !/^\d{2}:\d{2}$/.test(startTime) ||
+      !/^\d{2}:\d{2}$/.test(endTime)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide valid start and end times.'
+      });
+    }
+
     const startMins = timeToMinutes(startTime);
     let endMins = timeToMinutes(endTime);
-    const overnightBooking = Boolean(isOvernight);
+
+    if (
+      startMins < 0 ||
+      startMins >= 1440 ||
+      endMins < 0 ||
+      endMins >= 1440
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid booking time.'
+      });
+    }
 
     if (!overnightBooking && endMins <= startMins) {
       return res.status(400).json({
         success: false,
-        message: 'End time must be after start time for daytime bookings. For overnight care, please enable overnight option.'
+        message: 'End time must be after start time.'
       });
     }
 
     if (overnightBooking && endMins <= startMins) {
-      endMins += 24 * 60;
+      endMins += 1440;
     }
 
-    const durationMinutes = endMins - startMins;
-    if (durationMinutes <= 0) {
+    const totalHours =
+      Math.round(((endMins - startMins) / 60) * 10) / 10;
+
+    if (totalHours < 0.5) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid booking duration.'
+        message: 'Booking must be at least 30 minutes.'
       });
     }
 
-    const totalHours = Math.round((durationMinutes / 60) * 10) / 10;
-
-    // Check Provider Availability Schedule (if not 24x7)
+    // Check provider availability.
     if (!profile.is24x7Available) {
-      const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-      // Parse UTC date string YYYY-MM-DD
-      const [year, month, day] = dateString.split('-').map(Number);
-      const bookingDateObj = new Date(Date.UTC(year, month - 1, day));
-      const dayOfWeek = days[bookingDateObj.getUTCDay()];
+      const days = [
+        'Sunday',
+        'Monday',
+        'Tuesday',
+        'Wednesday',
+        'Thursday',
+        'Friday',
+        'Saturday'
+      ];
 
-      const daySchedule = (profile.availabilitySchedule || []).find(s => s.day === dayOfWeek);
+      const dayOfWeek = days[bookingDate.getDay()];
+
+      const daySchedule = (profile.availabilitySchedule || []).find(
+        (item) => item.day === dayOfWeek
+      );
 
       if (!daySchedule || !daySchedule.isAvailable) {
         return res.status(400).json({
           success: false,
-          message: `Provider is not available on ${dayOfWeek}s. Please choose an available day.`
+          message: `Provider is unavailable on ${dayOfWeek}.`
         });
       }
 
-      const provStart = timeToMinutes(daySchedule.startTime || '08:00');
-      const provEnd = timeToMinutes(daySchedule.endTime || '20:00');
+      const providerStart = timeToMinutes(
+        daySchedule.startTime || '08:00'
+      );
 
-      if (startMins < provStart || (!overnightBooking && endMins > provEnd)) {
+      const providerEnd = timeToMinutes(
+        daySchedule.endTime || '20:00'
+      );
+
+      if (
+        startMins < providerStart ||
+        (!overnightBooking && endMins > providerEnd)
+      ) {
         return res.status(400).json({
           success: false,
-          message: `Booking time (${startTime} - ${endTime}) falls outside provider's operating hours on ${dayOfWeek} (${daySchedule.startTime} - ${daySchedule.endTime}).`
+          message: 'Selected time is outside provider availability.'
         });
       }
     }
 
-    // Check for Capacity Conflicts with overlapping active bookings
+    /*
+     * CAPACITY CHECK
+     * Only active bookings that overlap the requested time
+     * should reduce the provider's available capacity.
+     */
+    const activeStatuses = [
+  'pending',
+  'confirmed',
+  'in-progress'
+];
+
     const activeBookings = await Booking.find({
       provider: providerUserId,
       dateString,
-      status: { $in: ['pending', 'confirmed', 'in-progress'] }
+      status: { $in: activeStatuses }
     });
 
-    let currentChildrenInSlot = 0;
+    let childrenAlreadyBooked = 0;
+
     for (const existing of activeBookings) {
+      if (
+        !existing.startTime ||
+        !existing.endTime
+      ) {
+        continue;
+      }
+
       const overlaps = doRangesOverlap(
         startTime,
         endTime,
         existing.startTime,
         existing.endTime,
         overnightBooking,
-        existing.isOvernight
+        Boolean(existing.isOvernight)
       );
 
-      if (overlaps) {
-        currentChildrenInSlot += (existing.numberOfChildren || 1);
-      }
+      if (!overlaps) continue;
+
+      const savedChildCount = Number(existing.numberOfChildren);
+
+      const existingChildren =
+        Number.isFinite(savedChildCount) && savedChildCount > 0
+          ? savedChildCount
+          : Array.isArray(existing.childDetails) &&
+              existing.childDetails.length > 0
+            ? existing.childDetails.length
+            : 1;
+
+      childrenAlreadyBooked += existingChildren;
     }
 
-    if (currentChildrenInSlot + numberOfChildren > maxCapacity) {
-      const remainingCapacity = Math.max(0, maxCapacity - currentChildrenInSlot);
+    const availablePlaces = Math.max(
+      0,
+      maxCapacity - childrenAlreadyBooked
+    );
+
+    console.log('BOOKING CAPACITY DEBUG:', {
+      providerId: String(providerUserId),
+      dateString,
+      requestedStartTime: startTime,
+      requestedEndTime: endTime,
+      overnightBooking,
+      maxCapacity,
+      childrenAlreadyBooked,
+      requestedChildren: numberOfChildren,
+      availablePlaces,
+      activeBookings: activeBookings.map((booking) => ({
+        id: String(booking._id),
+        status: booking.status,
+        dateString: booking.dateString,
+        numberOfChildren: booking.numberOfChildren,
+        startTime: booking.startTime,
+        endTime: booking.endTime,
+        isOvernight: booking.isOvernight
+      }))
+    });
+
+    if (numberOfChildren > availablePlaces) {
       return res.status(409).json({
         success: false,
-        message: `Capacity conflict: Provider has ${currentChildrenInSlot} child(ren) booked during this time window. Max capacity is ${maxCapacity} (only ${remainingCapacity} spot(s) remaining).`
+        message: `Capacity conflict. ${availablePlaces} place(s) remain.`,
+        data: {
+          maxCapacity,
+          childrenAlreadyBooked,
+          requestedChildren: numberOfChildren,
+          availablePlaces
+        }
       });
     }
 
-    // Calculate pricing
-    const applicableRate = overnightBooking ? (profile.overnightRate || profile.hourlyRate) : profile.hourlyRate;
-    const subtotal = Math.round(applicableRate * totalHours * numberOfChildren);
+    // Calculate price.
+    const hourlyRate = overnightBooking
+      ? (profile.overnightRate || profile.hourlyRate)
+      : profile.hourlyRate;
+
+    if (!Number.isFinite(Number(hourlyRate)) || Number(hourlyRate) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Provider hourly rate is not configured correctly.'
+      });
+    }
+
+    const subtotal = Math.round(
+      Number(hourlyRate) * totalHours * numberOfChildren
+    );
+
     const platformFee = 5;
     const totalAmount = subtotal + platformFee;
 
@@ -207,27 +369,22 @@ exports.createBooking = async (req, res, next) => {
       endTime,
       isOvernight: overnightBooking,
       totalHours,
-      hourlyRate: applicableRate,
+      hourlyRate: Number(hourlyRate),
       subtotal,
       platformFee,
       totalAmount,
-      status: 'pending',
+      status: 'pending_payment',
+      paymentStatus: 'pending',
+      paymentMethod: '',
+      paymentTransactionId: '',
+      paymentPaidAt: null,
       emergencyContact,
       specialInstructions: specialInstructions || ''
     });
 
-    // Notify provider
-    await Notification.create({
-      user: providerUserId,
-      title: 'New Booking Request',
-      message: `${req.user.name} requested childcare for ${numberOfChildren} child(ren) on ${dateString} (${startTime} - ${endTime}).`,
-      type: 'booking',
-      link: '/provider/dashboard'
-    });
-
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
-      message: 'Booking request created successfully.',
+      message: 'Booking created. Please choose a payment method.',
       data: booking
     });
   } catch (error) {
@@ -235,9 +392,131 @@ exports.createBooking = async (req, res, next) => {
   }
 };
 
-// @desc    Get bookings for logged in user (filtered by parent or provider role)
-// @route   GET /api/bookings
-// @access  Private
+// POST /api/bookings/:id/payment-method
+exports.selectPaymentMethod = async (req, res, next) => {
+  try {
+    const { paymentMethod } = req.body;
+
+    if (!['demo_upi', 'cash_after_service'].includes(paymentMethod)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Choose Demo UPI or Cash After Service.'
+      });
+    }
+
+    const booking = await Booking.findById(req.params.id);
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found.'
+      });
+    }
+
+    if (String(booking.parent) !== String(req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'You can only select payment for your own booking.'
+      });
+    }
+
+    if (booking.status !== 'pending_payment') {
+      return res.status(400).json({
+        success: false,
+        message: 'This booking is no longer awaiting payment selection.'
+      });
+    }
+
+    booking.paymentMethod = paymentMethod;
+
+    if (paymentMethod === 'demo_upi') {
+      booking.paymentStatus = 'pending';
+      booking.paymentTransactionId = '';
+      booking.paymentPaidAt = null;
+    } else {
+      booking.paymentStatus = 'due';
+      booking.paymentTransactionId = '';
+      booking.paymentPaidAt = null;
+    }
+
+    booking.status = 'pending';
+    await booking.save();
+
+    await notifyUser(
+      booking.provider,
+      'New Booking Request',
+      `A parent submitted a childcare booking for ${booking.dateString} (${booking.startTime} - ${booking.endTime}). Payment method: ${
+        paymentMethod === 'demo_upi'
+          ? 'Demo UPI (not a real payment)'
+          : 'Cash after service'
+      }.`,
+      '/provider/dashboard'
+    );
+
+    return res.status(200).json({
+      success: true,
+      message:
+        paymentMethod === 'demo_upi'
+          ? 'Demo payment selected. No real money was transferred.'
+          : 'Cash after service selected. Payment is due after care.',
+      realMoneyTransferred: false,
+      data: booking
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/bookings/:id/demo-payment
+exports.processDemoPayment = async (req, res, next) => {
+  try {
+    const booking = await Booking.findById(req.params.id);
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found.'
+      });
+    }
+
+    if (String(booking.parent) !== String(req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'You can only pay for your own booking.'
+      });
+    }
+
+    if (
+      booking.paymentMethod !== 'demo_upi' ||
+      booking.status !== 'pending' ||
+      booking.paymentStatus !== 'pending'
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'This booking is not awaiting a demo UPI payment.'
+      });
+    }
+
+    booking.paymentStatus = 'paid';
+    booking.paymentTransactionId = `DEMO-${crypto.randomUUID()}`;
+    booking.paymentPaidAt = new Date();
+
+    await booking.save();
+
+    return res.status(200).json({
+      success: true,
+      message:
+        'Demo payment simulated successfully. No real money transferred.',
+      demoPayment: true,
+      realMoneyTransferred: false,
+      data: booking
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/bookings
 exports.getMyBookings = async (req, res, next) => {
   try {
     const { status } = req.query;
@@ -249,17 +528,18 @@ exports.getMyBookings = async (req, res, next) => {
       query.provider = req.user._id;
     }
 
-    if (status) {
-      query.status = status;
-    }
+    if (status) query.status = status;
 
     const bookings = await Booking.find(query)
       .populate('parent', 'name email phone')
       .populate('provider', 'name email phone')
-      .populate('providerProfile', 'hourlyRate overnightRate rating city')
+      .populate(
+        'providerProfile',
+        'hourlyRate overnightRate rating city'
+      )
       .sort({ createdAt: -1 });
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       count: bookings.length,
       data: bookings
@@ -269,9 +549,7 @@ exports.getMyBookings = async (req, res, next) => {
   }
 };
 
-// @desc    Get single booking by ID
-// @route   GET /api/bookings/:id
-// @access  Private
+// GET /api/bookings/:id
 exports.getBookingById = async (req, res, next) => {
   try {
     const booking = await Booking.findById(req.params.id)
@@ -286,19 +564,22 @@ exports.getBookingById = async (req, res, next) => {
       });
     }
 
-    // Role check: Only parent, provider, or admin involved can view
-    const isParent = booking.parent._id.toString() === req.user._id.toString();
-    const isProvider = booking.provider._id.toString() === req.user._id.toString();
-    const isAdmin = req.user.role === 'admin';
+    const parentId = booking.parent._id || booking.parent;
+    const providerId = booking.provider._id || booking.provider;
 
-    if (!isParent && !isProvider && !isAdmin) {
+    const allowed =
+      String(parentId) === String(req.user._id) ||
+      String(providerId) === String(req.user._id) ||
+      req.user.role === 'admin';
+
+    if (!allowed) {
       return res.status(403).json({
         success: false,
         message: 'Not authorized to view this booking.'
       });
     }
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       data: booking
     });
@@ -307,12 +588,25 @@ exports.getBookingById = async (req, res, next) => {
   }
 };
 
-// @desc    Update booking status (confirmed, in-progress, completed, cancelled)
-// @route   PATCH /api/bookings/:id/status
-// @access  Private (Provider, Parent, Admin)
+// PATCH /api/bookings/:id/status
 exports.updateBookingStatus = async (req, res, next) => {
   try {
     const { status, cancellationReason } = req.body;
+
+    const allowedStatuses = [
+      'confirmed',
+      'in-progress',
+      'completed',
+      'cancelled'
+    ];
+
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid booking status.'
+      });
+    }
+
     const booking = await Booking.findById(req.params.id)
       .populate('parent', 'name email')
       .populate('provider', 'name email');
@@ -324,8 +618,11 @@ exports.updateBookingStatus = async (req, res, next) => {
       });
     }
 
-    const isParent = booking.parent._id.toString() === req.user._id.toString();
-    const isProvider = booking.provider._id.toString() === req.user._id.toString();
+    const parentId = booking.parent._id || booking.parent;
+    const providerId = booking.provider._id || booking.provider;
+
+    const isParent = String(parentId) === String(req.user._id);
+    const isProvider = String(providerId) === String(req.user._id);
     const isAdmin = req.user.role === 'admin';
 
     if (!isParent && !isProvider && !isAdmin) {
@@ -335,61 +632,66 @@ exports.updateBookingStatus = async (req, res, next) => {
       });
     }
 
-    // Validate state transitions
-    if (status === 'confirmed') {
-      if (!isProvider && !isAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: 'Only the provider or admin can confirm a booking.'
-        });
-      }
-      booking.status = 'confirmed';
-    } else if (status === 'in-progress') {
-      if (!isProvider && !isAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: 'Only the provider or admin can start the childcare session.'
-        });
-      }
-      booking.status = 'in-progress';
-    } else if (status === 'completed') {
-      if (!isProvider && !isAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: 'Only the provider or admin can complete a booking.'
-        });
-      }
-      booking.status = 'completed';
-    } else if (status === 'cancelled') {
-      if (booking.status === 'completed') {
-        return res.status(400).json({
-          success: false,
-          message: 'Cannot cancel an already completed booking.'
-        });
-      }
-      booking.status = 'cancelled';
-      booking.cancelledBy = req.user._id;
-      booking.cancellationReason = cancellationReason || `Cancelled by ${req.user.role}`;
-    } else {
+    if (
+      ['confirmed', 'in-progress', 'completed'].includes(status) &&
+      booking.paymentMethod === 'demo_upi' &&
+      booking.paymentStatus !== 'paid'
+    ) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid booking status.'
+        message: 'Demo UPI payment has not been completed.'
       });
+    }
+
+    if (
+      ['confirmed', 'in-progress', 'completed'].includes(status) &&
+      !isProvider &&
+      !isAdmin
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only the provider or admin can update this status.'
+      });
+    }
+
+    if (status === 'cancelled' && booking.status === 'completed') {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot cancel a completed booking.'
+      });
+    }
+
+    booking.status = status;
+
+    if (
+      status === 'completed' &&
+      booking.paymentMethod === 'cash_after_service' &&
+      booking.paymentStatus === 'due'
+    ) {
+      booking.paymentStatus = 'paid';
+      booking.paymentPaidAt = new Date();
+    }
+
+    if (status === 'cancelled') {
+      booking.cancelledBy = req.user._id;
+      booking.cancellationReason =
+        cancellationReason || `Cancelled by ${req.user.role}`;
     }
 
     await booking.save();
 
-    // Send notification to the opposite party
-    const targetUserId = isParent ? booking.provider._id : booking.parent._id;
-    await Notification.create({
-      user: targetUserId,
-      title: `Booking ${status.toUpperCase()}`,
-      message: `Booking for ${booking.dateString} (${booking.startTime} - ${booking.endTime}) is now ${status}.`,
-      type: 'booking',
-      link: isParent ? '/provider/dashboard' : '/parent/dashboard'
-    });
+    const targetUserId = isParent
+      ? providerId
+      : parentId;
 
-    res.status(200).json({
+    await notifyUser(
+      targetUserId,
+      `Booking ${status.toUpperCase()}`,
+      `Booking for ${booking.dateString} (${booking.startTime} - ${booking.endTime}) is now ${status}.`,
+      isParent ? '/provider/dashboard' : '/parent/dashboard'
+    );
+
+    return res.status(200).json({
       success: true,
       message: `Booking status updated to ${status}.`,
       data: booking

@@ -12,7 +12,17 @@
     "seed": "node server/seed/seed.js",
     "test": "npm --prefix server test"
   },
-  "keywords": ["childcare", "babysitting", "24x7", "react", "express", "mongodb"],
+  "keywords": [
+    "childcare",
+    "babysitting",
+    "24x7",
+    "react",
+    "express",
+    "mongodb"
+  ],
   "author": "Little Steps Team",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "jspdf": "^4.2.1"
+  }
 }

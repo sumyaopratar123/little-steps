@@ -22,7 +22,8 @@ const Footer = () => {
               <PhoneCall className="w-5 h-5 text-emerald-400 shrink-0" />
               <div>
                 <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">24/7 Family Dispatch Helpline</p>
-                <p className="text-sm font-extrabold text-white">1-800-STEPS-24</p>
+                <p className="text-sm font-extrabold text-white">littlesteps.support@gmail.com</p>
+                <p className="text-sm font-extrabold text-white">0-000-000-0000</p>
               </div>
             </div>
           </div>
