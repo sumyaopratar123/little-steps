@@ -3,8 +3,8 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     {
-      "source": "/api/:path*",
-      "destination": "https://little-steps-dytk.onrender.com/api/:path*"
+      "source": "/api/(.*)",
+      "destination": "https://little-steps-dytk.onrender.com/api/$1"
     },
     {
       "source": "/(.*)",
