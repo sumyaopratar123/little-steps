@@ -24,7 +24,6 @@ const doRangesOverlap = (
   if (overnight1 && e1 <= s1) e1 += 1440;
   if (overnight2 && e2 <= s2) e2 += 1440;
 
-  // Handle bookings that cross midnight.
   return (
     (s1 < e2 && e1 > s2) ||
     (overnight2 && s1 + 1440 < e2 && e1 + 1440 > s2) ||
@@ -43,7 +42,6 @@ const notifyUser = async (userId, title, message, link) => {
 };
 
 // POST /api/bookings
-// Create a booking.
 exports.createBooking = async (req, res, next) => {
   try {
     const {
@@ -137,6 +135,7 @@ exports.createBooking = async (req, res, next) => {
       });
     }
 
+    // Provider must be verified before accepting bookings.
     if (profile.verificationStatus !== 'verified') {
       return res.status(400).json({
         success: false,
@@ -249,16 +248,12 @@ exports.createBooking = async (req, res, next) => {
       }
     }
 
-    /*
-     * CAPACITY CHECK
-     * Only active bookings that overlap the requested time
-     * should reduce the provider's available capacity.
-     */
+    // Only active overlapping bookings reduce capacity.
     const activeStatuses = [
-  'pending',
-  'confirmed',
-  'in-progress'
-];
+      'pending',
+      'confirmed',
+      'in-progress'
+    ];
 
     const activeBookings = await Booking.find({
       provider: providerUserId,
@@ -269,10 +264,7 @@ exports.createBooking = async (req, res, next) => {
     let childrenAlreadyBooked = 0;
 
     for (const existing of activeBookings) {
-      if (
-        !existing.startTime ||
-        !existing.endTime
-      ) {
+      if (!existing.startTime || !existing.endTime) {
         continue;
       }
 
@@ -339,12 +331,15 @@ exports.createBooking = async (req, res, next) => {
       });
     }
 
-    // Calculate price.
+    // Calculate booking price.
     const hourlyRate = overnightBooking
       ? (profile.overnightRate || profile.hourlyRate)
       : profile.hourlyRate;
 
-    if (!Number.isFinite(Number(hourlyRate)) || Number(hourlyRate) <= 0) {
+    if (
+      !Number.isFinite(Number(hourlyRate)) ||
+      Number(hourlyRate) <= 0
+    ) {
       return res.status(400).json({
         success: false,
         message: 'Provider hourly rate is not configured correctly.'
